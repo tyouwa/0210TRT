@@ -196,6 +196,7 @@ def parse_store_page(html: str, store: dict[str, str], fetched_at: str) -> list[
                     "store_url": store["url"],
                     "room_no": room_no,
                     "size_jo": size_jo,
+                    "size_text_raw": size_text,
                     "price_normal": price_normal,
                     "price_discounted": price_discounted,
                     "dims": dims,

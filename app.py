@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hmac
 import json
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -10,6 +12,8 @@ from scraper import fetch_stores_latest
 
 STORE_FILE = Path(__file__).with_name("stores.json")
 APP_PASSWORD = "centric01"
+MAX_LOGIN_ATTEMPTS = 5
+LOCK_SECONDS = 60
 
 PRICE_MODE_OPTIONS = {
     "割引後（表示が “A円 → B円” のときはBを使う）": "discounted",
@@ -24,31 +28,33 @@ DISPLAY_COLUMNS = [
     "月額（通常料金）",
     "月額（割引後）",
     "幅・奥行・高さ",
-    "空きラベル",
     "取得時刻",
 ]
 
 
 def load_stores() -> list[dict[str, str]]:
-    with STORE_FILE.open("r", encoding="utf-8") as f:
-        stores = json.load(f)
+    if not STORE_FILE.exists():
+        raise FileNotFoundError(f"店舗リストファイルが見つかりません: {STORE_FILE}")
 
-    if not isinstance(stores, list):
-        raise ValueError("stores.json は配列形式で定義してください。")
+    text = STORE_FILE.read_text(encoding="utf-8")
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise ValueError("stores.json は配列形式である必要があります。")
 
-    validated: list[dict[str, str]] = []
-    for store in stores:
-        if not isinstance(store, dict):
+    stores: list[dict[str, str]] = []
+    for row in data:
+        if not isinstance(row, dict):
             continue
-        name = str(store.get("name", "")).strip()
-        url = str(store.get("url", "")).strip()
-        if name and url:
-            validated.append({"name": name, "url": url})
+        name = str(row.get("name", "")).strip()
+        url = str(row.get("url", "")).strip()
+        enabled = bool(row.get("enabled", True))
+        if not enabled:
+            continue
+        if not name or not url:
+            continue
+        stores.append({"name": name, "url": url})
 
-    if not validated:
-        raise ValueError("stores.json に有効な店舗定義がありません。")
-
-    return validated
+    return stores
 
 
 def parse_size_or_none(value: str) -> float | None:
@@ -75,6 +81,7 @@ def rows_to_dataframe(rows: list[dict]) -> pd.DataFrame:
                 "store_url",
                 "room_no",
                 "size_jo",
+                "size_text_raw",
                 "price_normal",
                 "price_discounted",
                 "dims",
@@ -85,6 +92,10 @@ def rows_to_dataframe(rows: list[dict]) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     df["size_jo"] = pd.to_numeric(df.get("size_jo"), errors="coerce")
+    if "size_text_raw" not in df.columns:
+        df["size_text_raw"] = ""
+    else:
+        df["size_text_raw"] = df["size_text_raw"].fillna("").astype(str)
     df["price_normal"] = pd.to_numeric(df.get("price_normal"), errors="coerce").astype("Int64")
     df["price_discounted"] = pd.to_numeric(df.get("price_discounted"), errors="coerce").astype("Int64")
     return df
@@ -103,22 +114,33 @@ def filter_and_sort(
 
     filtered = df[df["status_label"].isin(["空室"])].copy()
     filtered["size_jo"] = pd.to_numeric(filtered["size_jo"], errors="coerce")
+    if "size_text_raw" not in filtered.columns:
+        filtered["size_text_raw"] = ""
+    else:
+        filtered["size_text_raw"] = filtered["size_text_raw"].fillna("").astype(str)
+
+    # 検索判定は実際の帖数値を使う。数値欠損時のみ生テキストから補完する。
+    size_from_text = pd.to_numeric(
+        filtered["size_text_raw"].str.extract(r"([0-9]+(?:\.[0-9]+)?)\s*帖", expand=False),
+        errors="coerce",
+    )
+    filtered["match_size_jo"] = filtered["size_jo"].fillna(size_from_text)
 
     if exact_size is not None:
         filtered = filtered[
-            filtered["size_jo"].notna()
-            & ((filtered["size_jo"] - exact_size).abs() <= 1e-9)
+            filtered["match_size_jo"].notna()
+            & ((filtered["match_size_jo"] - exact_size).abs() <= 1e-9)
         ]
     else:
-        filtered = filtered[filtered["size_jo"].fillna(0) >= min_size]
+        filtered = filtered[filtered["match_size_jo"].fillna(0) >= min_size]
         if max_size is not None:
             filtered = filtered[
-                filtered["size_jo"].notna() & (filtered["size_jo"] <= max_size)
+                filtered["match_size_jo"].notna() & (filtered["match_size_jo"] <= max_size)
             ]
 
     sort_price_col = "price_discounted" if price_mode == "discounted" else "price_normal"
     filtered["sort_price"] = pd.to_numeric(filtered[sort_price_col], errors="coerce")
-    filtered["sort_size"] = pd.to_numeric(filtered["size_jo"], errors="coerce")
+    filtered["sort_size"] = pd.to_numeric(filtered["match_size_jo"], errors="coerce")
 
     if budget is not None:
         filtered = filtered[(filtered["sort_price"].notna()) & (filtered["sort_price"] <= budget)]
@@ -144,12 +166,22 @@ def to_display_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             "月額（通常料金）": df["price_normal"],
             "月額（割引後）": df["price_discounted"],
             "幅・奥行・高さ": df["dims"],
-            "空きラベル": df["status_label"],
             "取得時刻": df["fetched_at"],
         }
     )
 
     display_df["広さ（帖）"] = pd.to_numeric(display_df["広さ（帖）"], errors="coerce").round(2)
+    if "size_text_raw" in df.columns:
+        size_text = (
+            df["size_text_raw"]
+            .fillna("")
+            .astype(str)
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+        )
+        has_size_text = size_text.str.contains("帖", na=False)
+        display_df.loc[has_size_text, "広さ（帖）"] = size_text[has_size_text]
+
     display_df["月額（通常料金）"] = pd.to_numeric(display_df["月額（通常料金）"], errors="coerce").astype("Int64")
     display_df["月額（割引後）"] = pd.to_numeric(display_df["月額（割引後）"], errors="coerce").astype("Int64")
     return display_df
@@ -177,12 +209,18 @@ def build_fetch_error_message(exc: Exception) -> str:
     return message
 
 
+def get_app_password() -> str | None:
+    return APP_PASSWORD
+
+
 def init_session_state() -> None:
     defaults = {
         "display_df": None,
         "fetched_at": "",
         "errors": [],
         "is_authenticated": False,
+        "login_attempts": 0,
+        "lock_until": 0.0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -190,12 +228,21 @@ def init_session_state() -> None:
 
 
 def render_password_gate() -> None:
+    configured_password = get_app_password()
+
     if st.session_state.get("is_authenticated", False):
         with st.sidebar:
             if st.button("ログアウト"):
                 st.session_state["is_authenticated"] = False
                 st.rerun()
         return
+
+    lock_until = float(st.session_state.get("lock_until", 0.0))
+    now = time.time()
+    if lock_until > now:
+        remaining = int(lock_until - now) + 1
+        st.warning(f"ログイン試行回数が上限に達したため、{remaining}秒後に再試行してください。")
+        st.stop()
 
     st.subheader("ログイン")
     st.info("このアプリを利用するにはパスワードの入力が必要です。")
@@ -204,11 +251,23 @@ def render_password_gate() -> None:
         submitted = st.form_submit_button("ログイン")
 
     if submitted:
-        if password == APP_PASSWORD:
+        if hmac.compare_digest(password, configured_password):
             st.session_state["is_authenticated"] = True
+            st.session_state["login_attempts"] = 0
+            st.session_state["lock_until"] = 0.0
             st.rerun()
         else:
+            attempts = int(st.session_state.get("login_attempts", 0)) + 1
+            st.session_state["login_attempts"] = attempts
+            if attempts >= MAX_LOGIN_ATTEMPTS:
+                st.session_state["login_attempts"] = 0
+                st.session_state["lock_until"] = time.time() + LOCK_SECONDS
+                st.error("パスワードが違います。しばらく待ってから再試行してください。")
+                st.stop()
+
+            remaining = MAX_LOGIN_ATTEMPTS - attempts
             st.error("パスワードが違います。")
+            st.caption(f"あと {remaining} 回失敗すると一時ロックされます。")
 
     st.stop()
 
@@ -225,6 +284,10 @@ def main() -> None:
         stores = load_stores()
     except Exception as exc:
         st.error(f"店舗リストの読み込みに失敗しました: {exc}")
+        st.stop()
+
+    if not stores:
+        st.warning("有効な店舗が登録されていません。`stores.json` を確認してください。")
         st.stop()
 
     store_names = [store["name"] for store in stores]

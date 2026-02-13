@@ -53,13 +53,14 @@ python -m streamlit run app.py
 
 ## ログイン
 - 起動後、パスワード入力画面が表示されます。
-- パスワードは社内管理者から共有されたものを入力してください。
+- パスワードはアプリ内で固定設定されています（管理者から共有された値を入力してください）。
 
 ## Streamlit Community Cloud 公開時の補足
 - このリポジトリには `requirements.txt` に加えて `packages.txt` を含めています。
 - `packages.txt` は Playwright (Chromium) 実行に必要な Linux 依存を導入するためのものです。
 - Main file path を `vscode/app.py` にする構成では、`packages.txt` をリポジトリ直下と `vscode/` 配下の両方に置いてください。
 - 初回起動時に Chromium バイナリが未導入の場合、アプリ側で `playwright install chromium` を自動実行して再試行します。
+- 店舗リストを追加・変更する場合は `stores.json` を編集して再デプロイしてください。
 
 ## 使い方
 1. 対象店舗（複数可）を選択
